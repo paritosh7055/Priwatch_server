@@ -1,0 +1,21 @@
+services:
+  # Own local Postgres for this fork (used by DATABASE_URL in .env for local
+  # dev). Railway provides its own managed Postgres for the real deployment —
+  # this is only for testing locally before pushing.
+  postgres:
+    image: postgres:16-alpine
+    container_name: pricewatch-pg-blocked
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pricewatch_blocked
+    ports:
+      - '5435:5432'
+    volumes:
+      - pricewatch_blocked_pg:/var/lib/postgresql/data
+    restart: unless-stopped
+  # Redis is shared across the local forks — run `docker compose up -d redis`
+  # from ../../flipkart/server instead (it publishes 127.0.0.1:6379).
+  # This fork's REDIS_URL uses logical DB index 3 on that same instance.
+
+volumes:
+  pricewatch_blocked_pg:

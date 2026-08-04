@@ -1,0 +1,502 @@
+import { AlertType, Prisma } from '@prisma/client'
+import { prisma } from '../lib/prisma.js'
+import { scrapeProduct } from '../scrapers/index.js'
+import { withScrapeGate } from '../scrapers/scrapeGate.js'
+import { logActivity, sendTelegram } from './telegram.js'
+import {
+  discountChangeAlert,
+  newOfferAlert,
+  pincodeAvailableAlert,
+  priceDropAlert,
+  priceUpAlert,
+  type AlertCopy,
+} from './alertMessage.js'
+
+export type CheckJobData = {
+  productId: string
+  pincode?: string
+}
+
+function money(n: number) {
+  return new Prisma.Decimal(n)
+}
+
+function formatInr(n: number) {
+  return new Intl.NumberFormat('en-IN', {
+    style: 'currency',
+    currency: 'INR',
+    maximumFractionDigits: 0,
+  }).format(n)
+}
+
+function discountFrom(oldPrice?: number | null, price?: number | null) {
+  if (!oldPrice || !price || oldPrice <= price) return 0
+  return Math.round(((oldPrice - price) / oldPrice) * 100)
+}
+
+/** Prefer nickname → live scrape title → DB title (skip placeholder "Product"). */
+function displayName(
+  product: { nickname: string | null; title: string },
+  scrapeTitle?: string | null,
+) {
+  const nick = product.nickname?.trim()
+  if (nick) return nick
+
+  const clean = (raw?: string | null) => {
+    const t = raw?.trim()
+    if (!t) return null
+    if (/^https?:\/\//i.test(t)) return null
+    if (t.toLowerCase() === 'product') return null
+    return t
+  }
+
+  return clean(scrapeTitle) || clean(product.title) || 'Tracked item'
+}
+
+async function shouldAlert(type: AlertType) {
+  const owner = await prisma.owner.findFirst({ orderBy: { createdAt: 'asc' } })
+  if (!owner) return false
+  if (owner.pauseTracking) return false
+  switch (type) {
+    case 'price_decrease':
+      return owner.alertPriceDecrease
+    case 'price_increase':
+      return owner.alertPriceIncrease
+    case 'discount_change':
+      return owner.alertDiscountChange
+    case 'new_offer':
+      return owner.alertNewOffer
+    case 'pincode_available':
+      return owner.alertPincodeAvailable
+    default:
+      return true
+  }
+}
+
+async function createAlert(opts: {
+  productId: string
+  type: AlertType
+  copy: AlertCopy
+  oldPrice?: number
+  newPrice?: number
+  pincode?: string
+  telegramEnabled: boolean
+}) {
+  if (!(await shouldAlert(opts.type))) return null
+
+  const notification = await prisma.notification.create({
+    data: {
+      productId: opts.productId,
+      type: opts.type,
+      message: opts.copy.dashboard,
+      oldPrice: opts.oldPrice != null ? money(opts.oldPrice) : undefined,
+      newPrice: opts.newPrice != null ? money(opts.newPrice) : undefined,
+      pincode: opts.pincode,
+    },
+  })
+
+  if (opts.telegramEnabled) {
+    await sendTelegram(opts.copy.telegram, { html: true })
+  }
+
+  return notification
+}
+
+export async function checkProductJob(data: CheckJobData) {
+  const product = await prisma.product.findUnique({
+    where: { id: data.productId },
+    include: { store: true, pincodes: true },
+  })
+
+  if (!product) {
+    await logActivity('warn', 'worker', `Product missing: ${data.productId}`)
+    return { ok: false, reason: 'not_found' }
+  }
+
+  if (product.status === 'paused') {
+    return { ok: false, reason: 'paused' }
+  }
+
+  const owner = await prisma.owner.findFirst({ orderBy: { createdAt: 'asc' } })
+  if (owner?.pauseTracking) {
+    return { ok: false, reason: 'global_pause' }
+  }
+
+  const pinRow = data.pincode
+    ? product.pincodes.find((p) => p.pincode === data.pincode)
+    : undefined
+
+  if (product.store.requiresPincode && !data.pincode) {
+    await logActivity('warn', 'worker', `Pincode required for ${product.title}`)
+    return { ok: false, reason: 'pincode_required' }
+  }
+
+  const previousPrice = Number(product.currentPrice)
+  const previousDiscount = product.discount
+  const previousAvailable = pinRow?.lastAvailable ?? null
+
+  let scrape
+  try {
+    scrape = await withScrapeGate(() =>
+      scrapeProduct({
+        url: product.url,
+        storeSlug: product.store.slug,
+        pincode: data.pincode,
+        previousPrice,
+        previousAvailable,
+      }),
+    )
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'scrape failed'
+    // Pincode not deliverable is a normal business state — keep Tracking, mark unavailable
+    if (
+      /PIN_NOT_SERVICEABLE|NOT_SERVICEABLE|PRODUCT_NOT_IN_STORE/i.test(msg) &&
+      product.store.requiresPincode
+    ) {
+      if (data.pincode && pinRow) {
+        await prisma.productPincode.update({
+          where: { id: pinRow.id },
+          data: { lastAvailable: false, lastCheckedAt: new Date() },
+        })
+      }
+      // Don't blindly mark the whole product out-of-stock — another watched
+      // pincode may still be genuinely available. Only flip to out_of_stock
+      // when NO watched pincode currently reports available.
+      let stillAvailableElsewhere = false
+      if (product.store.requiresPincode && product.pincodes.length > 0) {
+        const rows = await prisma.productPincode.findMany({ where: { productId: product.id } })
+        stillAvailableElsewhere = rows.some((r) => r.lastAvailable === true && r.lastPrice != null)
+      }
+      await prisma.product.update({
+        where: { id: product.id },
+        data: {
+          status: 'tracking',
+          lastChecked: new Date(),
+          availability: stillAvailableElsewhere ? 'in_stock' : 'out_of_stock',
+        },
+      })
+      await logActivity(
+        'info',
+        product.store.slug,
+        `${product.title}: pincode ${data.pincode || ''} not serviceable — kept tracking`,
+      )
+      return {
+        ok: true,
+        source: 'live',
+        price: previousPrice,
+        available: false,
+        alerts: [],
+        skipped: 'pin_not_serviceable',
+      }
+    }
+
+    // Non-fatal scraper states: bad/unsupported product URL, missing WOW deal, or
+    // cloud anti-bot blocks. Keep tracking so the dashboard is not stuck in Error.
+    if (
+      /Use a direct product URL|No Flipkart WOW deal|Could not read this Flipkart product|Amazon blocks Railway|Amazon still blocked|No "Get it as low as"|Could not read this Tata Neu/i.test(
+        msg,
+      )
+    ) {
+      await prisma.product.update({
+        where: { id: product.id },
+        data: { status: 'tracking', lastChecked: new Date() },
+      })
+      await logActivity('warn', product.store.slug, `${product.title}: ${msg}`)
+      return {
+        ok: false,
+        source: 'live',
+        price: previousPrice,
+        available: previousAvailable ?? false,
+        alerts: [],
+        skipped: 'non_fatal_scrape',
+      }
+    }
+
+    await prisma.product.update({
+      where: { id: product.id },
+      data: { status: 'error', lastChecked: new Date() },
+    })
+    await logActivity('error', product.store.slug, `${product.title}: ${msg}`)
+    throw err
+  }
+
+  const alerts: string[] = []
+  const name = displayName(product, scrape.title)
+  const base = {
+    name,
+    storeName: product.store.name,
+    url: product.url,
+    pincode: data.pincode,
+    price: scrape.price,
+  }
+
+  // Flipkart must never store/alert on list/selling price — only WOW (Buy at / Lowest)
+  const flipkartNote = typeof scrape.rawNote === 'string' ? scrape.rawNote : ''
+  const flipkartMode = flipkartNote.match(/\bmode=(wow|sell)\b/)?.[1] || null
+  const flipkartWowMatchEarly = flipkartNote.match(/wow=(\d+)\s+sell=(\d+)/)
+  if (product.store.slug === 'flipkart') {
+    // Reject any sell-mode leftovers from older builds
+    if (flipkartMode === 'sell') {
+      const msg =
+        'No Flipkart WOW deal on this product right now. PriceWatch only tracks “Buy at ₹…” / “Lowest price for you”.'
+      await prisma.product.update({
+        where: { id: product.id },
+        data: { status: 'tracking', lastChecked: new Date() },
+      })
+      await logActivity('warn', product.store.slug, `${product.title}: ${msg}`)
+      return {
+        ok: false,
+        source: 'live',
+        price: previousPrice,
+        available: previousAvailable ?? false,
+        alerts: [],
+        skipped: 'flipkart_no_wow',
+      }
+    }
+
+    const wow = flipkartWowMatchEarly ? Number(flipkartWowMatchEarly[1]) : null
+    const sell = flipkartWowMatchEarly ? Number(flipkartWowMatchEarly[2]) : null
+    const explicit =
+      /buyAt=\d+/.test(flipkartNote) ||
+      /label=\d+/.test(flipkartNote) ||
+      flipkartMode === 'wow'
+    if (
+      wow == null ||
+      sell == null ||
+      !explicit ||
+      scrape.price !== wow ||
+      wow >= sell ||
+      (scrape.discount ?? 0) !== 0
+    ) {
+      const msg =
+        'No Flipkart WOW deal found for this product. PriceWatch only tracks “Buy at ₹…” / “Lowest price for you”, not the normal selling price.'
+      await prisma.product.update({
+        where: { id: product.id },
+        data: { status: 'tracking', lastChecked: new Date() },
+      })
+      await logActivity('warn', product.store.slug, `${product.title}: ${msg}`)
+      return {
+        ok: false,
+        source: 'live',
+        price: previousPrice,
+        available: previousAvailable ?? false,
+        alerts: [],
+        skipped: 'flipkart_no_wow',
+      }
+    }
+  }
+
+  if (data.pincode && pinRow) {
+    if (previousAvailable === false && scrape.available === true) {
+      await createAlert({
+        productId: product.id,
+        type: 'pincode_available',
+        copy: pincodeAvailableAlert({ ...base, price: scrape.price }),
+        newPrice: scrape.price,
+        pincode: data.pincode,
+        telegramEnabled: product.telegramEnabled,
+      })
+      alerts.push('pincode_available')
+    }
+
+    await prisma.productPincode.update({
+      where: { id: pinRow.id },
+      data: {
+        lastAvailable: scrape.available,
+        // Only overwrite the price snapshot when this pincode actually has one —
+        // an unavailable/OOS check often reports price 0, which must not clobber
+        // the last known real price for this specific pincode.
+        ...(scrape.available && scrape.price > 0
+          ? { lastPrice: money(scrape.price), lastOldPrice: scrape.oldPrice != null ? money(scrape.oldPrice) : null }
+          : {}),
+        lastCheckedAt: new Date(),
+      },
+    })
+  }
+
+  const canPriceAlert = !data.pincode || scrape.available
+  // Flipkart: only alert on confirmed WOW scrapes (never list/selling-price false positives)
+  const flipkartNoteFull = typeof scrape.rawNote === 'string' ? scrape.rawNote : ''
+  const flipkartWowMatch = flipkartNoteFull.match(/wow=(\d+)\s+sell=(\d+)/)
+  const flipkartWow = flipkartWowMatch ? Number(flipkartWowMatch[1]) : null
+  const flipkartSell = flipkartWowMatch ? Number(flipkartWowMatch[2]) : null
+  const isFlipkart = product.store.slug === 'flipkart'
+
+  // Jumping from a real WOW up to (near) list price is pollution — keep old WOW, no alert
+  const flipkartListPollution =
+    isFlipkart &&
+    flipkartSell != null &&
+    flipkartWow != null &&
+    previousPrice > 0 &&
+    ((previousPrice === flipkartSell && scrape.price === flipkartWow) ||
+      (scrape.price > previousPrice &&
+        scrape.price >= Math.round(flipkartSell * 0.98) &&
+        previousPrice < flipkartSell * 0.98))
+
+  if (isFlipkart && flipkartListPollution && scrape.price > previousPrice) {
+    await logActivity(
+      'warn',
+      'flipkart',
+      `Ignored list-price pollution on ${name}: ${previousPrice}→${scrape.price} (sell=${flipkartSell}) — keeping WOW`,
+    )
+    await prisma.product.update({
+      where: { id: product.id },
+      data: {
+        status: 'tracking',
+        lastChecked: new Date(),
+        currentPrice: money(previousPrice),
+        oldPrice: money(previousPrice),
+        discount: 0,
+      },
+    })
+    return {
+      ok: true,
+      source: scrape.source,
+      price: previousPrice,
+      available: scrape.available,
+      alerts: [],
+      skipped: 'flipkart_list_pollution',
+    }
+  }
+
+  const flipkartWowOk =
+    !isFlipkart ||
+    (flipkartWow != null &&
+      flipkartSell != null &&
+      scrape.price === flipkartWow &&
+      scrape.price < flipkartSell &&
+      !flipkartListPollution)
+
+  if (flipkartWowOk && canPriceAlert && previousPrice > 0 && scrape.price < previousPrice) {
+    await createAlert({
+      productId: product.id,
+      type: 'price_decrease',
+      copy: priceDropAlert({
+        ...base,
+        oldPrice: previousPrice,
+        newPrice: scrape.price,
+      }),
+      oldPrice: previousPrice,
+      newPrice: scrape.price,
+      pincode: data.pincode,
+      telegramEnabled: product.telegramEnabled,
+    })
+    alerts.push('price_decrease')
+  } else if (flipkartWowOk && canPriceAlert && previousPrice > 0 && scrape.price > previousPrice) {
+    await createAlert({
+      productId: product.id,
+      type: 'price_increase',
+      copy: priceUpAlert({
+        ...base,
+        oldPrice: previousPrice,
+        newPrice: scrape.price,
+      }),
+      oldPrice: previousPrice,
+      newPrice: scrape.price,
+      pincode: data.pincode,
+      telegramEnabled: product.telegramEnabled,
+    })
+    alerts.push('price_increase')
+  }
+
+  const newDiscount = scrape.discount ?? 0
+  // Flipkart tracks WOW price only — never alert on MRP/% discount
+  if (
+    product.store.slug !== 'flipkart' &&
+    canPriceAlert &&
+    previousDiscount !== newDiscount &&
+    previousPrice > 0
+  ) {
+    await createAlert({
+      productId: product.id,
+      type: 'discount_change',
+      copy: discountChangeAlert({
+        ...base,
+        oldDiscount: previousDiscount,
+        newDiscount,
+      }),
+      oldPrice: previousPrice,
+      newPrice: scrape.price,
+      pincode: data.pincode,
+      telegramEnabled: product.telegramEnabled,
+    })
+    alerts.push('discount_change')
+  }
+
+  if (scrape.offerText) {
+    await createAlert({
+      productId: product.id,
+      type: 'new_offer',
+      copy: newOfferAlert({ ...base, offerText: scrape.offerText }),
+      pincode: data.pincode,
+      telegramEnabled: product.telegramEnabled,
+    })
+    alerts.push('new_offer')
+  }
+
+  await prisma.priceHistory.create({
+    data: {
+      productId: product.id,
+      price: money(scrape.price),
+      discount: newDiscount,
+      pincode: data.pincode,
+    },
+  })
+
+  // Multi-pincode products (Blinkit/Instamart/etc.): the overall card/detail
+  // price must reflect the best AVAILABLE pincode, not whichever pincode this
+  // particular job happened to check — otherwise checking an out-of-stock
+  // pincode after an available one clobbers the product to "Out of Stock"
+  // even though it's genuinely available elsewhere.
+  let aggPrice = scrape.price
+  let aggOldPrice: number | null =
+    scrape.oldPrice != null ? scrape.oldPrice : previousPrice || scrape.price
+  let aggAvailable = scrape.available
+
+  if (product.store.requiresPincode && product.pincodes.length > 0) {
+    const rows = await prisma.productPincode.findMany({ where: { productId: product.id } })
+    const available = rows.filter((r) => r.lastAvailable === true && r.lastPrice != null)
+    if (available.length > 0) {
+      const best = available.reduce((a, b) => (Number(a.lastPrice) <= Number(b.lastPrice) ? a : b))
+      aggPrice = Number(best.lastPrice)
+      aggOldPrice = best.lastOldPrice != null ? Number(best.lastOldPrice) : aggPrice
+      aggAvailable = true
+    } else {
+      // No watched pincode is currently available — keep the last known good
+      // price instead of zeroing it out, but reflect the real availability.
+      aggPrice = previousPrice || scrape.price
+      aggOldPrice = previousPrice || scrape.price
+      aggAvailable = false
+    }
+  }
+  const aggDiscount = discountFrom(aggOldPrice, aggPrice)
+
+  await prisma.product.update({
+    where: { id: product.id },
+    data: {
+      status: 'tracking',
+      lastChecked: new Date(),
+      currentPrice: money(aggPrice),
+      // Prefer scraper MRP; Flipkart sets oldPrice === WOW so UI shows no strikethrough/%
+      oldPrice: money(isFlipkart ? aggPrice : (aggOldPrice ?? aggPrice)),
+      discount: isFlipkart ? 0 : aggDiscount,
+      title: name === 'Tracked item' ? product.title : name,
+      image: scrape.image || product.image,
+      availability: aggAvailable ? 'in_stock' : 'out_of_stock',
+    },
+  })
+
+  await logActivity(
+    'info',
+    'tracker',
+    `Checked ${name}${data.pincode ? ` @${data.pincode}` : ''} → ${formatInr(scrape.price)} (${scrape.source})${alerts.length ? ` alerts=${alerts.join(',')}` : ''}`,
+  )
+
+  return {
+    ok: true,
+    source: scrape.source,
+    price: scrape.price,
+    available: scrape.available,
+    alerts,
+  }
+}

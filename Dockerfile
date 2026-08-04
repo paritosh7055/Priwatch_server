@@ -5,6 +5,11 @@ WORKDIR /app
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
+# Dummy URLs so `prisma generate` (postinstall + explicit) can parse the schema
+# without real Railway secrets at build time. Runtime uses the real DATABASE_URL.
+ENV DATABASE_URL="postgresql://build:build@127.0.0.1:5432/build"
+ENV DIRECT_URL="postgresql://build:build@127.0.0.1:5432/build"
+
 # Install ALL deps (incl. typescript + @types) for compile — NODE_ENV=production
 # would skip devDependencies and break `tsc`.
 COPY package.json package-lock.json* ./
@@ -26,5 +31,8 @@ ENV SCRAPER_MODE=live
 
 EXPOSE 4000
 
-# prisma CLI stays via dependency; apply migrations then start
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+# Railway only injects DATABASE_URL from its Postgres plugin — DIRECT_URL is
+# optional. Default it to DATABASE_URL so `prisma migrate deploy` works without
+# an extra env var. Neon users who need a separate direct connection can still
+# set DIRECT_URL explicitly.
+CMD ["sh", "-c", "export DIRECT_URL=\"${DIRECT_URL:-$DATABASE_URL}\" && npx prisma migrate deploy && node dist/index.js"]

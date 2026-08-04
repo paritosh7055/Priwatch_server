@@ -3,9 +3,10 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL")
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  // No directUrl — Railway Postgres has no separate pooler URL.
+  // (Neon-style pooled setups that need DIRECT_URL can add it back.)
 }
 
 enum StoreCategory {

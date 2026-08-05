@@ -47,6 +47,8 @@ function displayName(
     if (!t) return null
     if (/^https?:\/\//i.test(t)) return null
     if (t.toLowerCase() === 'product') return null
+    // Tata Neu SPA meta title is just the store name
+    if (/^tata\s*neu$/i.test(t)) return null
     return t
   }
 
@@ -400,12 +402,17 @@ export async function checkProductJob(data: CheckJobData) {
   }
 
   const newDiscount = scrape.discount ?? 0
-  // Flipkart tracks WOW price only — never alert on MRP/% discount
+  // First successful scrape establishes a baseline — never alert on it.
+  // (Product is created with price 0 / discount 0 / no lastChecked.)
+  const isBaseline = !product.lastChecked || previousPrice <= 0
+
+  // Flipkart / Tata Neu track deal prices only — never alert on MRP/% vs selling
   if (
     product.store.slug !== 'flipkart' &&
+    product.store.slug !== 'tataneu' &&
+    !isBaseline &&
     canPriceAlert &&
-    previousDiscount !== newDiscount &&
-    previousPrice > 0
+    previousDiscount !== newDiscount
   ) {
     await createAlert({
       productId: product.id,
@@ -423,15 +430,26 @@ export async function checkProductJob(data: CheckJobData) {
     alerts.push('discount_change')
   }
 
-  if (scrape.offerText) {
-    await createAlert({
-      productId: product.id,
-      type: 'new_offer',
-      copy: newOfferAlert({ ...base, offerText: scrape.offerText }),
-      pincode: data.pincode,
-      telegramEnabled: product.telegramEnabled,
+  // Only alert when the offer *text* actually changes — not every time the
+  // same "With these 2 offers" line is still on the page (was spamming on add).
+  if (!isBaseline && scrape.offerText) {
+    const lastOffer = await prisma.notification.findFirst({
+      where: { productId: product.id, type: 'new_offer' },
+      orderBy: { createdAt: 'desc' },
     })
-    alerts.push('new_offer')
+    const sameOffer =
+      lastOffer?.message != null &&
+      lastOffer.message.toLowerCase().includes(scrape.offerText.toLowerCase())
+    if (!sameOffer) {
+      await createAlert({
+        productId: product.id,
+        type: 'new_offer',
+        copy: newOfferAlert({ ...base, offerText: scrape.offerText }),
+        pincode: data.pincode,
+        telegramEnabled: product.telegramEnabled,
+      })
+      alerts.push('new_offer')
+    }
   }
 
   await prisma.priceHistory.create({

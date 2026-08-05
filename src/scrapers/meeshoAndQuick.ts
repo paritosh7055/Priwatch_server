@@ -109,11 +109,6 @@ async function scrapeLivePage(
   }
 }
 
-export const meeshoScraper: StoreScraper = {
-  slug: 'meesho',
-  scrape: (ctx) => scrapeLivePage(ctx, 'Meesho'),
-}
-
 export const bigbasketScraper: StoreScraper = {
   slug: 'bigbasket',
   scrape: (ctx) => scrapeLivePage(ctx, 'BigBasket'),

@@ -8,17 +8,6 @@ const prisma = new PrismaClient()
 // IP — this fork exists to try a different egress IP (e.g. Railway).
 const stores = [
   {
-    slug: 'meesho',
-    name: 'Meesho',
-    domain: 'meesho.com',
-    website: 'https://www.meesho.com',
-    color: '#9F2089',
-    category: StoreCategory.ecommerce,
-    requiresPincode: false,
-    status: StoreHealth.healthy,
-    builtIn: true,
-  },
-  {
     slug: 'zepto',
     name: 'Zepto',
     domain: 'zeptonow.com',
@@ -81,6 +70,14 @@ async function main() {
       },
       create: store,
     })
+  }
+
+  // Remove Meesho if left from an older seed
+  const meesho = await prisma.store.findUnique({ where: { slug: 'meesho' } })
+  if (meesho) {
+    await prisma.product.deleteMany({ where: { storeId: meesho.id } })
+    await prisma.store.delete({ where: { id: meesho.id } })
+    console.log('Removed Meesho store + products')
   }
 
   console.log('Seed complete')

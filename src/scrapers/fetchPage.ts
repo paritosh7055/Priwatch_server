@@ -27,6 +27,29 @@ let browserPromise: Promise<Browser> | null = null
 const SCRAPE_PROXY_URL = process.env.SCRAPE_PROXY_URL?.trim() || ''
 let proxyDispatcherPromise: Promise<unknown> | null | undefined
 
+/**
+ * Only route these hosts through SCRAPE_PROXY_URL. Croma / Reliance Digital /
+ * Blinkit / JioMart / Instamart usually work from the VPS IP — forcing them
+ * through ScraperAPI causes chrome-error:// navigations and burns credits.
+ * Override with SCRAPE_PROXY_HOSTS=comma,separated,suffixes if needed.
+ */
+function proxyRequiredForUrl(url: string): boolean {
+  if (!SCRAPE_PROXY_URL) return false
+  const raw =
+    process.env.SCRAPE_PROXY_HOSTS?.trim() ||
+    'tataneu.com,bigbasket.com,zeptonow.com'
+  const hosts = raw
+    .split(',')
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean)
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '').toLowerCase()
+    return hosts.some((h) => host === h || host.endsWith(`.${h}`))
+  } catch {
+    return false
+  }
+}
+
 async function proxyDispatcher(): Promise<unknown | undefined> {
   if (!SCRAPE_PROXY_URL) return undefined
   if (proxyDispatcherPromise === undefined) {
@@ -92,20 +115,21 @@ function playwrightProxy(): { server: string; username?: string; password?: stri
 
 async function getBrowser() {
   if (!browserPromise) {
-    const proxy = playwrightProxy()
+    // Never attach SCRAPE_PROXY_URL at launch — proxy is applied per-context
+    // only for hosts that need it (see proxyRequiredForUrl). Otherwise every
+    // store (Reliance Digital, Croma, …) inherits a flaky proxy and dies with
+    // chrome-error://chromewebdata/.
     const launch = async () => {
       try {
         return await chromium.launch({
           channel: 'chrome',
           headless: true,
           args: LOW_MEM_ARGS,
-          ...(proxy ? { proxy } : {}),
         })
       } catch {
         return chromium.launch({
           headless: true,
           args: LOW_MEM_ARGS,
-          ...(proxy ? { proxy } : {}),
         })
       }
     }
@@ -161,8 +185,9 @@ export async function fetchHtml(
   const limits = scrapeLimits()
   const finalUrl = withScraperProxy(url, opts)
 
-  const doFetch = async (target: string) => {
-    const dispatcher = target.includes('scraperapi.com') ? undefined : await proxyDispatcher()
+  const doFetch = async (target: string, viaProxy: boolean) => {
+    const dispatcher =
+      target.includes('scraperapi.com') || !viaProxy ? undefined : await proxyDispatcher()
     return fetch(target, {
       headers: target.includes('scraperapi.com')
         ? { Accept: 'text/html' }
@@ -173,15 +198,14 @@ export async function fetchHtml(
     } as RequestInit)
   }
 
-  let res = await doFetch(finalUrl)
+  const wantProxy = proxyRequiredForUrl(url)
+  let res = await doFetch(finalUrl, wantProxy)
 
-  // ScraperAPI failing (exhausted credits, bad key, plan limit, etc.) used to
-  // take down every store on cloud, not just the ones that actually need the
-  // proxy — a single billing issue killed Flipkart/BigBasket/Instamart/etc.
-  // too. Fall back to a direct request instead; it may well still work for
-  // sites that aren't actually IP-blocking this host.
-  if (!res.ok && finalUrl !== url) {
-    const fallback = await doFetch(url).catch(() => null)
+  // ScraperAPI / residential proxy failing used to take down every store on
+  // cloud. Fall back to a direct request for hosts that don't strictly need it;
+  // for proxy-required hosts still try direct once so we surface BLOCKED clearly.
+  if (!res.ok && (finalUrl !== url || wantProxy)) {
+    const fallback = await doFetch(url, false).catch(() => null)
     if (fallback?.ok) res = fallback
   }
 
@@ -212,6 +236,8 @@ export async function fetchHtmlBrowser(
 
   const browser = await getBrowser()
   const navTimeout = opts?.navigationTimeoutMs ?? limits.navigationTimeoutMs
+  const useProxy = proxyRequiredForUrl(url)
+  const proxy = useProxy ? playwrightProxy() : undefined
   const context = await browser.newContext({
     userAgent: DEFAULT_HEADERS['User-Agent'],
     locale: 'en-IN',
@@ -222,7 +248,8 @@ export async function fetchHtmlBrowser(
     // cert to inspect/geo-route traffic — Chromium rejects that cert by
     // default, so every proxied request would otherwise fail with
     // ERR_CERT_AUTHORITY_INVALID before the page ever loads.
-    ignoreHTTPSErrors: Boolean(SCRAPE_PROXY_URL),
+    ignoreHTTPSErrors: Boolean(proxy),
+    ...(proxy ? { proxy } : {}),
     extraHTTPHeaders: {
       'Accept-Language': 'en-IN,en;q=0.9',
     },
@@ -251,14 +278,31 @@ export async function fetchHtmlBrowser(
   })
 
   try {
-    const gotoUrl = withScraperProxy(url, { render: false })
+    // Don't wrap proxy-required URLs through api.scraperapi.com when we already
+    // have SCRAPE_PROXY_URL on the browser context — double-proxy breaks nav.
+    const gotoUrl = useProxy ? url : withScraperProxy(url, { render: false })
     try {
       await page.goto(gotoUrl, { waitUntil: 'commit', timeout: navTimeout })
       await page
         .waitForLoadState('domcontentloaded', { timeout: Math.min(10_000, navTimeout) })
         .catch(() => undefined)
-    } catch {
-      await page.goto(gotoUrl, { waitUntil: 'domcontentloaded', timeout: navTimeout })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (/chrome-error:\/\/|ERR_|net::|interrupted by another navigation/i.test(msg)) {
+        // One retry without proxy wrapper / with direct URL
+        try {
+          await page.goto(url, { waitUntil: 'domcontentloaded', timeout: navTimeout })
+        } catch (err2) {
+          const msg2 = err2 instanceof Error ? err2.message : String(err2)
+          throw new Error(
+            /chrome-error:\/\/|ERR_|net::|interrupted by another navigation/i.test(msg2)
+              ? `Could not open ${url} (browser navigation failed). Often a temporary network/CDN glitch — try Refresh again.`
+              : msg2,
+          )
+        }
+      } else {
+        await page.goto(gotoUrl, { waitUntil: 'domcontentloaded', timeout: navTimeout })
+      }
     }
 
     const continueBtn = page.locator('text=Continue shopping').first()

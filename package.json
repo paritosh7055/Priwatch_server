@@ -2,7 +2,7 @@
   "name": "pricewatch-server-blocked",
   "version": "1.0.0",
   "private": true,
-  "description": "PriceWatch API (Blocked-stores fork: Meesho, Zepto, BigBasket, Tata Neu) — stores that are edge/WAF-blocked from the Hetzner VPS IP, meant for a different egress IP (e.g. Railway) — single-user personal price & pincode tracker",
+  "description": "PriceWatch API (Blocked-stores fork: Zepto, BigBasket, Tata Neu) — edge/WAF-blocked stores for a different egress IP (e.g. Railway)",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

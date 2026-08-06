@@ -10,8 +10,8 @@ const stores = [
   {
     slug: 'zepto',
     name: 'Zepto',
-    domain: 'zeptonow.com',
-    website: 'https://www.zeptonow.com',
+    domain: 'zepto.com',
+    website: 'https://www.zepto.com',
     color: '#3C019F',
     category: StoreCategory.quick_commerce,
     requiresPincode: true,

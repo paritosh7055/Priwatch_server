@@ -37,7 +37,7 @@ function proxyRequiredForUrl(url: string): boolean {
   if (!SCRAPE_PROXY_URL) return false
   const raw =
     process.env.SCRAPE_PROXY_HOSTS?.trim() ||
-    'tataneu.com,bigbasket.com,zeptonow.com,zepto.com'
+    'tataneu.com,bigbasket.com,zepto.com'
   const hosts = raw
     .split(',')
     .map((h) => h.trim().toLowerCase())

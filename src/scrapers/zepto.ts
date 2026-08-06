@@ -34,9 +34,8 @@ import type { ScrapeContext, ScrapeResult, StoreScraper } from './types.js'
 // ---------------------------------------------------------------------------
 const PROVIDER = 'zepto'
 const UA = process.env.ZEPTO_USER_AGENT?.trim() || DEFAULT_UA
-/** Primary web origin (both zepto.com and zeptonow.com are official). */
+/** Official site: https://www.zepto.com/ */
 const ORIGIN = 'https://www.zepto.com'
-const ORIGIN_ALT = 'https://www.zeptonow.com'
 const BFF = 'https://bff-gateway.zepto.com'
 /** Web artifact version — bump if responses degrade. Verified 16.16.0 (2026-07-17). */
 const APP_VERSION = process.env.ZEPTO_APP_VERSION?.trim() || '16.16.0'
@@ -235,27 +234,19 @@ async function getSession(force = false): Promise<Session> {
     return cached
   }
 
-  const origins = [ORIGIN, ORIGIN_ALT]
   let jar = new CookieJar()
-
-  for (const origin of origins) {
-    try {
-      jar = await handshakeViaFetch(origin)
-      if (jarLooksValid(jar)) break
-    } catch (err) {
-      dbg('fetch handshake failed:', origin, err instanceof Error ? err.message : err)
-      jar = new CookieJar()
-    }
+  try {
+    jar = await handshakeViaFetch(ORIGIN)
+  } catch (err) {
+    dbg('fetch handshake failed:', err instanceof Error ? err.message : err)
+    jar = new CookieJar()
   }
 
   if (!jarLooksValid(jar)) {
-    for (const origin of origins) {
-      try {
-        jar = await handshakeViaBrowser(origin)
-        if (jarLooksValid(jar)) break
-      } catch (err) {
-        dbg('browser handshake failed:', origin, err instanceof Error ? err.message : err)
-      }
+    try {
+      jar = await handshakeViaBrowser(ORIGIN)
+    } catch (err) {
+      dbg('browser handshake failed:', err instanceof Error ? err.message : err)
     }
   }
 

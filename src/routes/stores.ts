@@ -116,12 +116,20 @@ storesRouter.patch('/:id', async (req, res, next) => {
   try {
     const existing = await prisma.store.findUnique({ where: { id: req.params.id } })
     if (!existing) return res.status(404).json({ error: 'Store not found' })
-    if (existing.builtIn) {
-      return res.status(400).json({ error: 'Built-in stores cannot be edited' })
-    }
 
     const body = updateStoreSchema.parse(req.body)
     const data: Record<string, unknown> = {}
+
+    // Built-in stores: allow domain/website/color/name sync (e.g. zeptonow → zepto.com)
+    // but not category/pincode changes or deletion.
+    if (existing.builtIn) {
+      const forbidden = ['requiresPincode', 'category'] as const
+      for (const key of forbidden) {
+        if (body[key] != null) {
+          return res.status(400).json({ error: 'Built-in store category/pincode cannot be edited' })
+        }
+      }
+    }
 
     if (body.name != null) data.name = body.name.trim()
     if (body.domain != null) {
@@ -132,11 +140,13 @@ storesRouter.patch('/:id', async (req, res, next) => {
     }
     if (body.website != null) data.website = body.website || null
     if (body.color != null) data.color = body.color
-    if (body.requiresPincode != null) {
-      data.requiresPincode = body.requiresPincode
-      data.category = body.requiresPincode ? 'quick_commerce' : 'ecommerce'
+    if (!existing.builtIn) {
+      if (body.requiresPincode != null) {
+        data.requiresPincode = body.requiresPincode
+        data.category = body.requiresPincode ? 'quick_commerce' : 'ecommerce'
+      }
+      if (body.category != null) data.category = body.category
     }
-    if (body.category != null) data.category = body.category
 
     const store = await prisma.store.update({
       where: { id: existing.id },

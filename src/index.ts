@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { createApp } from './app.js'
+import { syncBuiltInStores } from './lib/syncBuiltInStores.js'
 import { pingRedis } from './queue/connection.js'
 import { startCheckWorker } from './queue/worker.js'
 import { startScheduler } from './queue/scheduler.js'
@@ -12,6 +13,15 @@ app.listen(port, '0.0.0.0', () => {
   console.log(`PriceWatch API listening on http://0.0.0.0:${port}`)
   console.log(`Health: http://0.0.0.0:${port}/api/health`)
 })
+
+void syncBuiltInStores()
+  .then(() => console.log('[stores] built-in metadata synced'))
+  .catch((err) =>
+    console.warn(
+      '[stores] sync failed:',
+      err instanceof Error ? err.message : err,
+    ),
+  )
 
 const enableWorker = (process.env.ENABLE_WORKER || 'true').toLowerCase() !== 'false'
 

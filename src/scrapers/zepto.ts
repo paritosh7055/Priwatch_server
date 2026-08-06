@@ -15,6 +15,7 @@ import {
   discountFrom,
   extractJsonLd,
   fetchHtml,
+  fetchHtmlBrowser,
   parseMoney,
   pickMeta,
 } from './fetchPage.js'
@@ -33,7 +34,9 @@ import type { ScrapeContext, ScrapeResult, StoreScraper } from './types.js'
 // ---------------------------------------------------------------------------
 const PROVIDER = 'zepto'
 const UA = process.env.ZEPTO_USER_AGENT?.trim() || DEFAULT_UA
+/** Primary web origin (both zepto.com and zeptonow.com are official). */
 const ORIGIN = 'https://www.zepto.com'
+const ORIGIN_ALT = 'https://www.zeptonow.com'
 const BFF = 'https://bff-gateway.zepto.com'
 /** Web artifact version — bump if responses degrade. Verified 16.16.0 (2026-07-17). */
 const APP_VERSION = process.env.ZEPTO_APP_VERSION?.trim() || '16.16.0'
@@ -182,9 +185,9 @@ function jarLooksValid(jar: CookieJar) {
   return jar.has('XSRF-TOKEN') && jar.has('device_id')
 }
 
-async function handshakeViaFetch(): Promise<CookieJar> {
+async function handshakeViaFetch(origin = ORIGIN): Promise<CookieJar> {
   const jar = new CookieJar()
-  const res = await fetch(`${ORIGIN}/`, {
+  const res = await fetch(`${origin}/`, {
     headers: {
       'User-Agent': UA,
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -194,19 +197,20 @@ async function handshakeViaFetch(): Promise<CookieJar> {
     signal: AbortSignal.timeout(20_000),
   })
   jar.applySetCookie(res)
-  dbg('handshake(fetch)', res.status, 'cookies:', jar.keys().join(','))
+  dbg('handshake(fetch)', origin, res.status, 'cookies:', jar.keys().join(','))
   return jar
 }
 
-async function handshakeViaBrowser(): Promise<CookieJar> {
+async function handshakeViaBrowser(origin = ORIGIN): Promise<CookieJar> {
   const cookies = await harvestCookies({
     provider: PROVIDER,
-    url: `${ORIGIN}/`,
-    waitMs: 2500,
+    url: `${origin}/`,
+    // Cloud hosts need longer for WAF JS to mint cookies
+    waitMs: Number(process.env.ZEPTO_HANDSHAKE_WAIT_MS || 4500),
   })
   const jar = new CookieJar()
   jar.applyPlaywright(cookies)
-  dbg('handshake(browser) cookies:', jar.keys().join(','))
+  dbg('handshake(browser)', origin, 'cookies:', jar.keys().join(','))
   return jar
 }
 
@@ -225,33 +229,42 @@ async function getSession(force = false): Promise<Session> {
       `session: reuse disk/memory cookies age=${Math.round(age / 1000)}s ` +
         `keys=${cached.jar.keys().join(',')}`,
     )
-    // Soft TTL exceeded → still reuse, but mark so next BLOCKED triggers refresh
     if (age > SESSION_TTL_MS) {
       cached.meta.stale = true
     }
     return cached
   }
 
-  // 1) Cheap fetch handshake
-  let jar: CookieJar
-  try {
-    jar = await handshakeViaFetch()
-  } catch (err) {
-    dbg('fetch handshake failed:', err instanceof Error ? err.message : err)
-    jar = new CookieJar()
-  }
+  const origins = [ORIGIN, ORIGIN_ALT]
+  let jar = new CookieJar()
 
-  // 2) Browser fallback only if fetch didn't yield a usable session
-  if (!jarLooksValid(jar)) {
+  for (const origin of origins) {
     try {
-      jar = await handshakeViaBrowser()
+      jar = await handshakeViaFetch(origin)
+      if (jarLooksValid(jar)) break
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      throw new ZeptoError('BLOCKED', `session handshake failed (fetch + browser): ${msg}`)
+      dbg('fetch handshake failed:', origin, err instanceof Error ? err.message : err)
+      jar = new CookieJar()
     }
   }
+
   if (!jarLooksValid(jar)) {
-    throw new ZeptoError('BLOCKED', 'session handshake produced no XSRF-TOKEN/device_id')
+    for (const origin of origins) {
+      try {
+        jar = await handshakeViaBrowser(origin)
+        if (jarLooksValid(jar)) break
+      } catch (err) {
+        dbg('browser handshake failed:', origin, err instanceof Error ? err.message : err)
+      }
+    }
+  }
+
+  if (!jarLooksValid(jar)) {
+    throw new ZeptoError(
+      'BLOCKED',
+      'Zepto BFF session cookies missing (XSRF-TOKEN/device_id). ' +
+        'Will try product-page scrape fallback. Full pincode checks need a clean session.',
+    )
   }
 
   const session = new Session(PROVIDER)
@@ -521,8 +534,7 @@ export async function checkZeptoPincode(
 // ---------------------------------------------------------------------------
 // HTML fallback (share links / no pvid) — availability unknown → true
 // ---------------------------------------------------------------------------
-async function scrapeZeptoHtml(url: string): Promise<ScrapeResult> {
-  const $ = await fetchHtml(url)
+function parseZeptoDom($: ReturnType<typeof import('cheerio').load>, note: string): ScrapeResult {
   const ld = extractJsonLd($)
   const title =
     pickMeta($, ['meta[property="og:title"]', 'h1', 'title']) || ld?.title || undefined
@@ -530,6 +542,8 @@ async function scrapeZeptoHtml(url: string): Promise<ScrapeResult> {
   const price =
     parseMoney($('meta[property="product:price:amount"]').attr('content')) ||
     parseMoney($('[itemprop="price"]').attr('content')) ||
+    parseMoney($('[class*="Price"]').first().text()) ||
+    parseMoney($('[class*="price"]').first().text()) ||
     ld?.price ||
     null
   if (!price) throw new ZeptoError('PRODUCT_NOT_FOUND', 'price not found on product page')
@@ -543,7 +557,31 @@ async function scrapeZeptoHtml(url: string): Promise<ScrapeResult> {
     discount: discountFrom(oldPrice, price),
     available: true,
     source: 'live',
-    rawNote: 'html-no-pvid',
+    rawNote: note,
+  }
+}
+
+async function scrapeZeptoHtml(url: string): Promise<ScrapeResult> {
+  const $ = await fetchHtml(url)
+  return parseZeptoDom($, 'html-no-pvid')
+}
+
+/**
+ * Same idea as Tata Neu / BigBasket: render the product page when the BFF
+ * session handshake is blocked (common on Railway/cloud IPs). Price/title/image
+ * still track; per-pincode availability is best-effort only.
+ */
+async function scrapeZeptoPageFallback(url: string): Promise<ScrapeResult> {
+  try {
+    const $ = await fetchHtmlBrowser(url, {
+      waitText: /₹|Rs\.|add to cart|out of stock/i,
+      waitMs: 2000,
+      navigationTimeoutMs: 35_000,
+    })
+    return parseZeptoDom($, 'browser-fallback (BFF session blocked)')
+  } catch {
+    const $ = await fetchHtml(url)
+    return parseZeptoDom($, 'http-fallback (BFF session blocked)')
   }
 }
 
@@ -554,7 +592,11 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
   const variantId = extractZeptoVariantId(ctx.url)
   if (!variantId) {
     dbg('no pvid in URL — HTML fallback', ctx.url)
-    return scrapeZeptoHtml(ctx.url)
+    try {
+      return await scrapeZeptoHtml(ctx.url)
+    } catch {
+      return scrapeZeptoPageFallback(ctx.url)
+    }
   }
 
   // One automatic retry with a forced fresh session on WAF/session errors.
@@ -562,13 +604,26 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
   try {
     check = await checkZeptoPincode(ctx.url, ctx.pincode, variantId)
   } catch (err) {
+    // CloudFront often blocks BFF cookie handshake on Railway — same IP can
+    // still load the product page (like Tata Neu / BigBasket). Fall back.
+    if (err instanceof ZeptoError && err.code === 'BLOCKED') {
+      log(`BFF session blocked — product page fallback`)
+      return scrapeZeptoPageFallback(ctx.url)
+    }
     if (
       err instanceof ZeptoError &&
-      (err.code === 'SESSION_EXPIRED' || err.code === 'BLOCKED' || err.code === 'RATE_LIMITED')
+      (err.code === 'SESSION_EXPIRED' || err.code === 'RATE_LIMITED')
     ) {
       log(`retrying after ${err.code}: forcing fresh session`)
-      await getSession(true)
-      check = await checkZeptoPincode(ctx.url, ctx.pincode, variantId)
+      try {
+        await getSession(true)
+        check = await checkZeptoPincode(ctx.url, ctx.pincode, variantId)
+      } catch (err2) {
+        log(
+          `BFF still failing (${err2 instanceof Error ? err2.message : err2}) — product page fallback`,
+        )
+        return scrapeZeptoPageFallback(ctx.url)
+      }
     } else {
       throw err
     }

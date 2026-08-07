@@ -588,6 +588,8 @@ export type HarvestOpts = {
   url: string
   /** Cookies to preset before navigation (e.g. location). */
   presetCookies?: { name: string; value: string; domain: string; path?: string }[]
+  /** Optional geolocation permission + coords (Zepto store resolution). */
+  geolocation?: { latitude: number; longitude: number }
   waitMs?: number
   /** Run inside the page after load (set location, click, etc.). */
   onPage?: (ctx: BrowserContext) => Promise<void>
@@ -608,6 +610,12 @@ export async function harvestCookies(opts: HarvestOpts): Promise<{ name: string;
     timezoneId: 'Asia/Kolkata',
     viewport: { width: 1280, height: 800 },
     extraHTTPHeaders: { 'Accept-Language': 'en-IN,en;q=0.9' },
+    ...(opts.geolocation
+      ? {
+          geolocation: opts.geolocation,
+          permissions: ['geolocation'],
+        }
+      : {}),
   })
   try {
     if (opts.presetCookies?.length) {

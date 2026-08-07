@@ -42,8 +42,10 @@ const APP_VERSION = process.env.ZEPTO_APP_VERSION?.trim() || '16.16.0'
 /** Soft TTL — expired sessions are still tried from disk before a full re-handshake. */
 const SESSION_TTL_MS = Number(process.env.ZEPTO_SESSION_TTL_MS || 10 * 60_000)
 const DEBUG = /^(1|true|yes|on)$/i.test(process.env.ZEPTO_DEBUG || '')
-/** Fallback sample store (Bangalore superstore) for no-pincode price lookups. */
-const SAMPLE_STORE_ID = 'b1403534-cd6b-49d0-a7cd-ce20e6497768'
+/** Fallback sample store when no pincode / store resolution fails.
+ *  Prefer a store that actually carries common SKUs (fallbackType=NONE). */
+const SAMPLE_STORE_ID =
+  process.env.ZEPTO_SAMPLE_STORE_ID?.trim() || '0059ff6a-7eb0-477a-a7f5-69256f2c444b'
 
 // ---------------------------------------------------------------------------
 // Error taxonomy
@@ -122,6 +124,9 @@ function bffHeaders(jar: CookieJar, storeId?: string): HeadersInit {
     headers.sessionid = sessionId
   }
   if (storeId) {
+    // CamelCase storeId is required — query param alone can return a stub
+    // with outOfStock:true for every product.
+    headers.storeId = storeId
     headers.store_id = storeId
     headers.storeid = storeId
     headers.store_ids = storeId
@@ -312,13 +317,26 @@ async function geocodePincode(
 // The homepage HEAD sets a `serviceability` cookie describing the primaryStore
 // for the given user_position. Verified working 2026-07-17.
 // ---------------------------------------------------------------------------
-type StoreInfo = { serviceable: boolean; storeId?: string; city?: string; etaMinutes?: number }
+type StoreInfo = {
+  serviceable: boolean
+  storeId?: string
+  secondaryStoreId?: string
+  city?: string
+  etaMinutes?: number
+  secondaryEtaMinutes?: number
+}
 
 function parseServiceability(jar: CookieJar): StoreInfo {
   const raw = jar.value('serviceability')
   if (!raw) return { serviceable: false }
   let svc: {
     primaryStore?: {
+      serviceable?: boolean
+      isDeliverable?: boolean
+      storeId?: string
+      etaInMinutes?: string | number
+    }
+    secondaryStore?: {
       serviceable?: boolean
       isDeliverable?: boolean
       storeId?: string
@@ -332,25 +350,34 @@ function parseServiceability(jar: CookieJar): StoreInfo {
     return { serviceable: false }
   }
   const p = svc.primaryStore
+  const s = svc.secondaryStore
+  const secondaryOk = Boolean((s?.serviceable || s?.isDeliverable) && s?.storeId)
   return {
     serviceable: Boolean(p?.serviceable || p?.isDeliverable),
     storeId: p?.storeId,
     city: svc.storeDetailedInfo?.city,
     etaMinutes: p?.etaInMinutes != null ? Number(p.etaInMinutes) : undefined,
+    secondaryStoreId: secondaryOk ? s?.storeId : undefined,
+    secondaryEtaMinutes:
+      secondaryOk && s?.etaInMinutes != null ? Number(s.etaInMinutes) : undefined,
   }
 }
 
 async function resolveStore(session: Session, lat: number, lng: number): Promise<StoreInfo> {
   // Clear stale serviceability so the HEAD resolves THIS pin's store
   session.jar.delete('serviceability')
-  const pos = encodeURIComponent(JSON.stringify({ latitude: lat, longitude: lng }))
+  const posJson = JSON.stringify({ latitude: lat, longitude: lng })
+  const pos = encodeURIComponent(posJson)
   const started = Date.now()
+
+  // 1) Cheap HEAD (works when edge isn't challenging)
   let res: Response
   try {
     res = await fetch(`${ORIGIN}/`, {
       method: 'HEAD',
       headers: {
         'User-Agent': UA,
+        Accept: 'text/html',
         'Accept-Language': 'en-IN,en;q=0.9',
         Cookie: session.jar.header({ user_position: pos }),
       },
@@ -358,14 +385,78 @@ async function resolveStore(session: Session, lat: number, lng: number): Promise
       signal: AbortSignal.timeout(15_000),
     })
   } catch (err) {
-    throw new ZeptoError('UNKNOWN', `resolveStore HEAD failed: ${err instanceof Error ? err.message : err}`)
+    throw new ZeptoError(
+      'UNKNOWN',
+      `resolveStore HEAD failed: ${err instanceof Error ? err.message : err}`,
+    )
   }
   session.jar.applySetCookie(res)
-  persist(session)
   dbg(`resolveStore HEAD ${res.status} ${Date.now() - started}ms`)
-  const errCls = classifyStatus(res.status, 'resolveStore')
-  if (errCls) throw errCls
-  return parseServiceability(session.jar)
+
+  let info = parseServiceability(session.jar)
+  if (info.storeId || info.serviceable) {
+    persist(session)
+    return info
+  }
+
+  // 2) GET fallback (some edges reject HEAD)
+  try {
+    res = await fetch(`${ORIGIN}/`, {
+      headers: {
+        'User-Agent': UA,
+        Accept: 'text/html',
+        'Accept-Language': 'en-IN,en;q=0.9',
+        Cookie: session.jar.header({ user_position: pos }),
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(20_000),
+    })
+    session.jar.applySetCookie(res)
+    dbg(`resolveStore GET ${res.status}`)
+    info = parseServiceability(session.jar)
+    if (info.storeId || info.serviceable) {
+      persist(session)
+      return info
+    }
+  } catch (err) {
+    dbg('resolveStore GET failed', err instanceof Error ? err.message : err)
+  }
+
+  // 3) Browser: complete WAF JS challenge and mint serviceability cookie.
+  // Plain fetch often gets HTTP 202 challenge HTML with zero Set-Cookie.
+  try {
+    const cookies = await harvestCookies({
+      provider: PROVIDER,
+      url: `${ORIGIN}/`,
+      waitMs: Number(process.env.ZEPTO_STORE_WAIT_MS || 5000),
+      geolocation: { latitude: lat, longitude: lng },
+      presetCookies: [
+        ...session.jar.keys().map((name) => ({
+          name,
+          value: session.jar.raw(name) || '',
+          domain: '.zepto.com',
+        })),
+        {
+          name: 'user_position',
+          value: pos,
+          domain: '.zepto.com',
+        },
+      ],
+    })
+    session.jar.applyPlaywright(cookies)
+    info = parseServiceability(session.jar)
+    dbg(
+      `resolveStore browser serviceable=${info.serviceable} store=${info.storeId?.slice(0, 8) ?? '-'}`,
+    )
+    persist(session)
+    return info
+  } catch (err) {
+    dbg('resolveStore browser failed', err instanceof Error ? err.message : err)
+  }
+
+  persist(session)
+  // Distinguish "couldn't resolve" (no cookie) from true unserviceable.
+  return { serviceable: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +475,7 @@ type ZeptoStoreProduct = {
   }
 }
 type ZeptoProductDetail = {
+  fallbackType?: string
   product?: {
     name?: string
     brand?: string
@@ -441,7 +533,13 @@ export type ZeptoCheck = {
 function computeAvailability(
   sp: ZeptoStoreProduct | undefined,
   atcActions: unknown[] | undefined,
+  fallbackType?: string,
 ): { status: ZeptoAvailability; quantity: number | null } {
+  // Zepto returns another store's stub with outOfStock:true when the requested
+  // store doesn't carry the variant — that is NOT a real OOS for this pin.
+  if (fallbackType && fallbackType !== 'NONE') {
+    return { status: 'PRODUCT_NOT_IN_STORE', quantity: null }
+  }
   if (!sp) return { status: 'PRODUCT_NOT_IN_STORE', quantity: null }
   if (sp.productVariant?.isActive === false || sp.productVariant?.Unlisted === true) {
     return { status: 'PRODUCT_NOT_IN_STORE', quantity: sp.availableQuantity ?? null }
@@ -467,11 +565,12 @@ export async function checkZeptoPincode(
   if (!pincode) {
     const detail = await fetchProductDetail(session, SAMPLE_STORE_ID, variantId)
     const sp = detail.product?.storeProducts?.[0]
+    const { status } = computeAvailability(sp, detail.product?.atcActions, detail.fallbackType)
     const price = paiseToInr(sp?.discountedSellingPrice) ?? paiseToInr(sp?.superSaverSellingPrice)
     return {
-      availability: 'UNKNOWN',
-      available: true,
-      price,
+      availability: status === 'PRODUCT_NOT_IN_STORE' ? 'UNKNOWN' : status,
+      available: status !== 'OUT_OF_STOCK' && status !== 'PRODUCT_NOT_IN_STORE',
+      price: status === 'PRODUCT_NOT_IN_STORE' ? null : price,
       oldPrice: paiseToInr(sp?.mrp) || undefined,
       title: detail.product?.name,
       image: imageFromDetail(detail),
@@ -501,23 +600,63 @@ export async function checkZeptoPincode(
     }
   }
 
-  const detail = await fetchProductDetail(session, store.storeId, variantId)
-  const sp = detail.product?.storeProducts?.[0]
-  const { status, quantity } = computeAvailability(sp, detail.product?.atcActions)
-  const price = paiseToInr(sp?.discountedSellingPrice) ?? paiseToInr(sp?.superSaverSellingPrice)
+  // Check primary, then secondary (Zepto often fulfils from secondary when
+  // primary lacks the SKU — otherwise we false-report PRODUCT_NOT_IN_STORE).
+  const storeIds = [store.storeId, store.secondaryStoreId].filter(
+    (id, i, arr): id is string => Boolean(id) && arr.indexOf(id) === i,
+  )
+
+  let lastTitle: string | undefined
+  let lastImage: string | undefined
+  let lastOld: number | undefined
+
+  for (const sid of storeIds) {
+    const detail = await fetchProductDetail(session, sid, variantId)
+    const sp = detail.product?.storeProducts?.[0]
+    const { status, quantity } = computeAvailability(
+      sp,
+      detail.product?.atcActions,
+      detail.fallbackType,
+    )
+    lastTitle = detail.product?.name || lastTitle
+    lastImage = imageFromDetail(detail) || lastImage
+    lastOld = paiseToInr(sp?.mrp) || lastOld
+
+    if (status === 'PRODUCT_NOT_IN_STORE') {
+      dbg(`store ${sid.slice(0, 8)} does not carry variant — trying next`)
+      continue
+    }
+
+    const price = paiseToInr(sp?.discountedSellingPrice) ?? paiseToInr(sp?.superSaverSellingPrice)
+    return {
+      availability: status,
+      available: status === 'AVAILABLE',
+      price,
+      oldPrice: lastOld,
+      title: lastTitle,
+      image: lastImage,
+      diagnostics: {
+        ...diagBase,
+        storeId: sid,
+        productExists: true,
+        quantity,
+        outOfStock: sp?.outOfStock,
+        etaMinutes: sid === store.secondaryStoreId ? store.secondaryEtaMinutes : store.etaMinutes,
+      },
+    }
+  }
 
   return {
-    availability: status,
-    available: status === 'AVAILABLE',
-    price,
-    oldPrice: paiseToInr(sp?.mrp) || undefined,
-    title: detail.product?.name,
-    image: imageFromDetail(detail),
+    availability: 'PRODUCT_NOT_IN_STORE',
+    available: false,
+    price: null,
+    oldPrice: lastOld,
+    title: lastTitle,
+    image: lastImage,
     diagnostics: {
       ...diagBase,
-      productExists: Boolean(sp),
-      quantity,
-      outOfStock: sp?.outOfStock,
+      productExists: false,
+      quantity: null,
     },
   }
 }
@@ -636,22 +775,66 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
     let title = check.title
     let image = check.image
     let oldPrice = check.oldPrice
+    let catalogAvailable: boolean | undefined
+
+    // Prefer live catalog from a known sample store (SPA HTML has no price).
+    if (!price || !title) {
+      try {
+        const session = await getSession()
+        const detail = await fetchProductDetail(session, SAMPLE_STORE_ID, variantId)
+        if (!detail.fallbackType || detail.fallbackType === 'NONE') {
+          const sp = detail.product?.storeProducts?.[0]
+          const catalogPrice =
+            paiseToInr(sp?.discountedSellingPrice) ?? paiseToInr(sp?.superSaverSellingPrice)
+          if (catalogPrice) price = catalogPrice
+          title = title || detail.product?.name
+          image = image || imageFromDetail(detail)
+          oldPrice = oldPrice ?? (paiseToInr(sp?.mrp) || undefined)
+          const av = computeAvailability(sp, detail.product?.atcActions, detail.fallbackType)
+          catalogAvailable = av.status === 'AVAILABLE'
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
     if (!price) {
       try {
-        const html = await scrapeZeptoHtml(ctx.url)
+        const html = await scrapeZeptoPageFallback(ctx.url)
         price = html.price
         title = title || html.title
         image = image || html.image
         oldPrice = oldPrice ?? html.oldPrice
       } catch {
-        /* no public price */
+        try {
+          const html = await scrapeZeptoHtml(ctx.url)
+          price = html.price
+          title = title || html.title
+          image = image || html.image
+          oldPrice = oldPrice ?? html.oldPrice
+        } catch {
+          /* no public price */
+        }
       }
     }
     if (!price && ctx.previousPrice && ctx.previousPrice > 0) {
       price = ctx.previousPrice
     }
+
+    // Store resolve failed (no serviceability cookie) ≠ pin unserviceable.
+    // SUPER_SAVER / national catalog SKUs often aren't in the local dark store
+    // but still sell to the pin — don't mark those as "Out of stock here".
+    const resolveFailed = !d.storeId && check.availability === 'NOT_SERVICEABLE'
+    const superSaver = /marketplaceType=SUPER_SAVER/i.test(ctx.url) || /[?&]marketplace=SUPER_SAVER/i.test(ctx.url)
+    const available =
+      (resolveFailed && catalogAvailable === true) ||
+      (check.availability === 'PRODUCT_NOT_IN_STORE' &&
+        catalogAvailable === true &&
+        (superSaver || resolveFailed))
+        ? true
+        : false
+
     if (!price) {
-      // Still a successful check: pincode simply can't deliver this item
       return {
         title,
         image,
@@ -669,9 +852,13 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
       price,
       oldPrice,
       discount: discountFrom(oldPrice, price),
-      available: false,
+      available,
       source: 'live',
-      rawNote: `pin ${ctx.pincode} ${check.availability} city=${d.city ?? '?'}`,
+      rawNote: resolveFailed
+        ? `pin ${ctx.pincode} STORE_UNRESOLVED catalog=${catalogAvailable ? 'in_stock' : 'n/a'} (list price)`
+        : available && check.availability === 'PRODUCT_NOT_IN_STORE'
+          ? `pin ${ctx.pincode} SUPER_SAVER/list price (not in local dark store) city=${d.city ?? '?'}`
+          : `pin ${ctx.pincode} ${check.availability} city=${d.city ?? '?'}`,
     }
   }
 

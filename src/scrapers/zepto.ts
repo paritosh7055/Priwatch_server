@@ -42,10 +42,19 @@ const APP_VERSION = process.env.ZEPTO_APP_VERSION?.trim() || '16.16.0'
 /** Soft TTL — expired sessions are still tried from disk before a full re-handshake. */
 const SESSION_TTL_MS = Number(process.env.ZEPTO_SESSION_TTL_MS || 10 * 60_000)
 const DEBUG = /^(1|true|yes|on)$/i.test(process.env.ZEPTO_DEBUG || '')
-/** Fallback sample store when no pincode / store resolution fails.
- *  Prefer a store that actually carries common SKUs (fallbackType=NONE). */
-const SAMPLE_STORE_ID =
-  process.env.ZEPTO_SAMPLE_STORE_ID?.trim() || '0059ff6a-7eb0-477a-a7f5-69256f2c444b'
+/** Fallback sample stores when no pincode / local dark store lacks the SKU.
+ *  Prefer stores that return fallbackType=NONE for common catalog items. */
+const SAMPLE_STORE_IDS = (
+  process.env.ZEPTO_SAMPLE_STORE_IDS?.trim() ||
+  [
+    process.env.ZEPTO_SAMPLE_STORE_ID?.trim() || '0059ff6a-7eb0-477a-a7f5-69256f2c444b',
+    'b1403534-cd6b-49d0-a7cd-ce20e6497768',
+  ].join(',')
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+const SAMPLE_STORE_ID = SAMPLE_STORE_IDS[0]
 
 // ---------------------------------------------------------------------------
 // Error taxonomy
@@ -662,8 +671,65 @@ export async function checkZeptoPincode(
 }
 
 // ---------------------------------------------------------------------------
-// HTML fallback (share links / no pvid) — availability unknown → true
+// Catalog / HTML helpers
 // ---------------------------------------------------------------------------
+function titleFromUrl(url: string): string | undefined {
+  try {
+    const m = new URL(url).pathname.match(/\/pn\/([^/]+)/i)
+    if (!m) return undefined
+    return decodeURIComponent(m[1])
+      .replace(/-/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase())
+  } catch {
+    return undefined
+  }
+}
+
+function isSuperSaverUrl(url: string) {
+  return /marketplaceType=SUPER_SAVER/i.test(url) || /[?&]marketplace=SUPER_SAVER/i.test(url)
+}
+
+/** Live list price from a known sample store — Zepto SPA HTML has no usable price. */
+async function scrapeFromCatalog(
+  variantId: string,
+  note: string,
+  opts?: { forceSession?: boolean; preferAvailable?: boolean },
+): Promise<ScrapeResult | null> {
+  try {
+    const session = await getSession(Boolean(opts?.forceSession))
+    if (opts?.preferAvailable) session.jar.set('marketplace', 'SUPER_SAVER')
+
+    for (const storeId of SAMPLE_STORE_IDS) {
+      try {
+        const detail = await fetchProductDetail(session, storeId, variantId)
+        if (detail.fallbackType && detail.fallbackType !== 'NONE') continue
+        const sp = detail.product?.storeProducts?.[0]
+        if (!sp) continue
+        const price =
+          paiseToInr(sp.discountedSellingPrice) ?? paiseToInr(sp.superSaverSellingPrice)
+        if (!price) continue
+        const oldPrice = paiseToInr(sp.mrp) || undefined
+        const av = computeAvailability(sp, detail.product?.atcActions, detail.fallbackType)
+        return {
+          title: detail.product?.name,
+          image: imageFromDetail(detail),
+          price,
+          oldPrice,
+          discount: discountFrom(oldPrice, price),
+          available: av.status === 'AVAILABLE',
+          source: 'live',
+          rawNote: `${note} store=${storeId.slice(0, 8)}`,
+        }
+      } catch (err) {
+        dbg('catalog store failed', storeId.slice(0, 8), err instanceof Error ? err.message : err)
+      }
+    }
+  } catch (err) {
+    dbg('catalog fallback failed', err instanceof Error ? err.message : err)
+  }
+  return null
+}
+
 function parseZeptoDom($: ReturnType<typeof import('cheerio').load>, note: string): ScrapeResult {
   const ld = extractJsonLd($)
   const title =
@@ -697,21 +763,42 @@ async function scrapeZeptoHtml(url: string): Promise<ScrapeResult> {
 }
 
 /**
- * Same idea as Tata Neu / BigBasket: render the product page when the BFF
- * session handshake is blocked (common on Railway/cloud IPs). Price/title/image
- * still track; per-pincode availability is best-effort only.
+ * Last-resort page scrape. Prefer BFF catalog whenever a pvid is known —
+ * Zepto's SPA shell usually has no static price in HTML.
  */
-async function scrapeZeptoPageFallback(url: string): Promise<ScrapeResult> {
+async function scrapeZeptoPageFallback(url: string, variantId?: string): Promise<ScrapeResult> {
+  if (variantId) {
+    const catalog = await scrapeFromCatalog(variantId, 'catalog-fallback', {
+      forceSession: true,
+      preferAvailable: isSuperSaverUrl(url),
+    })
+    if (catalog) return catalog
+  }
+
   try {
     const $ = await fetchHtmlBrowser(url, {
       waitText: /₹|Rs\.|add to cart|out of stock/i,
       waitMs: 2000,
       navigationTimeoutMs: 35_000,
     })
-    return parseZeptoDom($, 'browser-fallback (BFF session blocked)')
+    return parseZeptoDom($, 'browser-fallback')
   } catch {
-    const $ = await fetchHtml(url)
-    return parseZeptoDom($, 'http-fallback (BFF session blocked)')
+    try {
+      const $ = await fetchHtml(url)
+      return parseZeptoDom($, 'http-fallback')
+    } catch {
+      if (variantId) {
+        const catalog = await scrapeFromCatalog(variantId, 'catalog-after-html-fail', {
+          forceSession: true,
+          preferAvailable: true,
+        })
+        if (catalog) return catalog
+      }
+      throw new ZeptoError(
+        'PRODUCT_NOT_FOUND',
+        'Could not read Zepto price (page has no static price; catalog API also failed). Retry in a moment.',
+      )
+    }
   }
 }
 
@@ -734,25 +821,21 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
   try {
     check = await checkZeptoPincode(ctx.url, ctx.pincode, variantId)
   } catch (err) {
-    // CloudFront often blocks BFF cookie handshake on Railway — same IP can
-    // still load the product page (like Tata Neu / BigBasket). Fall back.
-    if (err instanceof ZeptoError && err.code === 'BLOCKED') {
-      log(`BFF session blocked — product page fallback`)
-      return scrapeZeptoPageFallback(ctx.url)
-    }
+    // CloudFront often blocks BFF cookie handshake on Railway — use catalog
+    // sample-store price (HTML has no price on Zepto SPA).
     if (
       err instanceof ZeptoError &&
-      (err.code === 'SESSION_EXPIRED' || err.code === 'RATE_LIMITED')
+      (err.code === 'BLOCKED' || err.code === 'SESSION_EXPIRED' || err.code === 'RATE_LIMITED')
     ) {
-      log(`retrying after ${err.code}: forcing fresh session`)
+      log(`BFF ${err.code} — catalog/page fallback`)
       try {
         await getSession(true)
         check = await checkZeptoPincode(ctx.url, ctx.pincode, variantId)
       } catch (err2) {
         log(
-          `BFF still failing (${err2 instanceof Error ? err2.message : err2}) — product page fallback`,
+          `BFF still failing (${err2 instanceof Error ? err2.message : err2}) — catalog fallback`,
         )
-        return scrapeZeptoPageFallback(ctx.url)
+        return scrapeZeptoPageFallback(ctx.url, variantId)
       }
     } else {
       throw err
@@ -779,53 +862,41 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
 
     // Prefer live catalog from a known sample store (SPA HTML has no price).
     if (!price || !title) {
-      try {
-        const session = await getSession()
-        const detail = await fetchProductDetail(session, SAMPLE_STORE_ID, variantId)
-        if (!detail.fallbackType || detail.fallbackType === 'NONE') {
-          const sp = detail.product?.storeProducts?.[0]
-          const catalogPrice =
-            paiseToInr(sp?.discountedSellingPrice) ?? paiseToInr(sp?.superSaverSellingPrice)
-          if (catalogPrice) price = catalogPrice
-          title = title || detail.product?.name
-          image = image || imageFromDetail(detail)
-          oldPrice = oldPrice ?? (paiseToInr(sp?.mrp) || undefined)
-          const av = computeAvailability(sp, detail.product?.atcActions, detail.fallbackType)
-          catalogAvailable = av.status === 'AVAILABLE'
-        }
-      } catch {
-        /* ignore */
+      const catalog = await scrapeFromCatalog(variantId, 'pin-enrichment', {
+        preferAvailable: isSuperSaverUrl(ctx.url),
+      })
+      if (catalog) {
+        price = catalog.price
+        title = title || catalog.title
+        image = image || catalog.image
+        oldPrice = oldPrice ?? catalog.oldPrice
+        catalogAvailable = catalog.available
       }
     }
 
     if (!price) {
       try {
-        const html = await scrapeZeptoPageFallback(ctx.url)
+        const html = await scrapeZeptoPageFallback(ctx.url, variantId)
         price = html.price
         title = title || html.title
         image = image || html.image
         oldPrice = oldPrice ?? html.oldPrice
+        if (catalogAvailable == null) catalogAvailable = html.available
       } catch {
-        try {
-          const html = await scrapeZeptoHtml(ctx.url)
-          price = html.price
-          title = title || html.title
-          image = image || html.image
-          oldPrice = oldPrice ?? html.oldPrice
-        } catch {
-          /* no public price */
-        }
+        /* no public price */
       }
     }
     if (!price && ctx.previousPrice && ctx.previousPrice > 0) {
       price = ctx.previousPrice
     }
 
+    title = title || titleFromUrl(ctx.url)
+
     // Store resolve failed (no serviceability cookie) ≠ pin unserviceable.
     // SUPER_SAVER / national catalog SKUs often aren't in the local dark store
     // but still sell to the pin — don't mark those as "Out of stock here".
     const resolveFailed = !d.storeId && check.availability === 'NOT_SERVICEABLE'
-    const superSaver = /marketplaceType=SUPER_SAVER/i.test(ctx.url) || /[?&]marketplace=SUPER_SAVER/i.test(ctx.url)
+    const superSaver = isSuperSaverUrl(ctx.url)
     const available =
       (resolveFailed && catalogAvailable === true) ||
       (check.availability === 'PRODUCT_NOT_IN_STORE' &&
@@ -835,16 +906,12 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
         : false
 
     if (!price) {
-      return {
-        title,
-        image,
-        price: ctx.previousPrice && ctx.previousPrice > 0 ? ctx.previousPrice : 0,
-        oldPrice,
-        discount: 0,
-        available: false,
-        source: 'live',
-        rawNote: `pin ${ctx.pincode} ${check.availability} city=${d.city ?? '?'} (no price)`,
-      }
+      // Still succeed the check with title so add/refresh doesn't hard-fail
+      // on SPA pages; worker can retry later for price.
+      throw new ZeptoError(
+        'PRODUCT_NOT_FOUND',
+        `No Zepto price yet for pin ${ctx.pincode} (catalog + page empty). Retry refresh.`,
+      )
     }
     return {
       title,
@@ -863,6 +930,10 @@ async function scrapeZepto(ctx: ScrapeContext): Promise<ScrapeResult> {
   }
 
   if (!check.price) {
+    const catalog = await scrapeFromCatalog(variantId, 'missing-pin-price', {
+      preferAvailable: isSuperSaverUrl(ctx.url),
+    })
+    if (catalog) return catalog
     throw new ZeptoError('PRODUCT_NOT_FOUND', `pincode ${ctx.pincode}: no price returned`)
   }
 
